@@ -1,0 +1,182 @@
+import requests
+import time
+import json
+import os
+from datetime import datetime, timedelta
+from pathlib import Path
+
+# ====================== CONFIG ======================
+# These will be read from Railway Variables
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Traders you want to follow
+WATCHED_TRADERS = {
+    "smol_intern",
+    "iruletrenches",
+    "frankdegods",
+    "0xAvast",
+    "Salem1299534",
+    "Aurelius0121",
+    "ether_monk",
+    "31337___",
+}
+
+# Filters
+MIN_BUY_USD = 200
+MAX_MCAP = 1_500_000
+MIN_FOLLOWERS = 10000
+ONLY_NEW_POSITION = True
+MIN_LIQUIDITY = 8000
+TOKEN_COOLDOWN_MINUTES = 15
+
+POLL_SECONDS = 8
+SEEN_FILE = "seen_trades.json"
+COOLDOWN_FILE = "token_cooldowns.json"
+# ====================================================
+
+seen_ids = set()
+token_cooldowns = {}
+
+def load_json(file, default):
+    if Path(file).exists():
+        try:
+            with open(file, "r") as f:
+                return json.load(f)
+        except:
+            return default
+    return default
+
+def save_json(file, data):
+    with open(file, "w") as f:
+        json.dump(data, f)
+
+def send_telegram(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        print("Telegram not configured")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print(f"Telegram error: {e}")
+
+def is_bad_flags(flags):
+    if not flags:
+        return False
+    bad_keywords = ["honeypot", "spoof", "airdropped", "transferred", "not a real", "parked"]
+    return any(any(bad in str(f).lower() for bad in bad_keywords) for f in flags)
+
+def format_alert(trade):
+    symbol = trade.get("symbol", "???")
+    handle = trade.get("handle", "???")
+    usd = trade.get("usd", 0)
+    mcap = trade.get("mcap", 0)
+    followers = trade.get("followers", 0)
+    liquidity = trade.get("liquidity", 0)
+    price = trade.get("price")
+    pair_url = trade.get("pair_url", "")
+    ca = trade.get("token", "")
+    flags = trade.get("flags", [])
+
+    msg = (
+        f"🚨 <b>SMART MONEY BUY</b>\n\n"
+        f"<b>{symbol}</b>\n"
+        f"Trader: <code>{handle}</code> ({followers:,} followers)\n"
+        f"Size: <b>${usd:,.0f}</b>\n"
+        f"Mcap: ${mcap:,.0f}\n"
+        f"Liquidity: ${liquidity:,.0f}\n"
+        f"Price: {price}\n"
+    )
+    if flags:
+        msg += f"Flags: {', '.join(flags)}\n"
+    msg += f"\n<a href='{pair_url}'>DexScreener</a>\n"
+    msg += f"<code>{ca}</code>"
+    return msg
+
+def check_tape():
+    global seen_ids, token_cooldowns
+
+    try:
+        r = requests.get("https://rhtrenches.com/api/tape?limit=40", timeout=12)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Fetch error: {e}")
+        return
+
+    now = datetime.now()
+
+    for trade in reversed(data):
+        trade_id = trade.get("id")
+        if not trade_id or trade_id in seen_ids:
+            continue
+
+        seen_ids.add(trade_id)
+
+        if trade.get("side") != "buy":
+            continue
+        if trade.get("handle") not in WATCHED_TRADERS:
+            continue
+        if trade.get("usd", 0) < MIN_BUY_USD:
+            continue
+        if trade.get("mcap", 999_999_999) > MAX_MCAP:
+            continue
+        if trade.get("followers", 0) < MIN_FOLLOWERS:
+            continue
+        if ONLY_NEW_POSITION and not trade.get("new_position"):
+            continue
+        if trade.get("liquidity", 0) < MIN_LIQUIDITY:
+            continue
+        if is_bad_flags(trade.get("flags", [])):
+            continue
+        if trade.get("is_stock"):
+            continue
+
+        symbol = trade.get("symbol", "UNKNOWN")
+
+        last_alert = token_cooldowns.get(symbol)
+        if last_alert:
+            try:
+                if (now - datetime.fromisoformat(last_alert)) < timedelta(minutes=TOKEN_COOLDOWN_MINUTES):
+                    continue
+            except:
+                pass
+
+        # Good signal
+        alert_text = format_alert(trade)
+        send_telegram(alert_text)
+
+        print(f"[{now.strftime('%H:%M:%S')}] ALERT → {symbol} | ${trade.get('usd', 0):,.0f} by {trade.get('handle')}")
+
+        token_cooldowns[symbol] = now.isoformat()
+
+    # Keep only recent seen IDs
+    save_json(SEEN_FILE, list(seen_ids)[-2000:])
+    save_json(COOLDOWN_FILE, token_cooldowns)
+
+def main():
+    global seen_ids, token_cooldowns
+
+    seen_ids = set(load_json(SEEN_FILE, []))
+    token_cooldowns = load_json(COOLDOWN_FILE, {})
+
+    print("=" * 50)
+    print("rhtrenches Smart Money Bot Started")
+    print(f"Watching {len(WATCHED_TRADERS)} traders")
+    print("=" * 50)
+
+    while True:
+        check_tape()
+        time.sleep(POLL_SECONDS)
+
+if __name__ == "__main__":
+    main()
